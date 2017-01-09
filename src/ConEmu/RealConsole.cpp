@@ -117,6 +117,7 @@ THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define DEBUGSTRSEL(s) DEBUGSTR(s)
 #define DEBUGSTRTEXTSEL(s) DEBUGSTR(s)
 #define DEBUGSTRCLICKPOS(s) DEBUGSTR(s)
+#define DEBUGSTRCTRLBS(s) DEBUGSTR(s)
 
 // Иногда не отрисовывается диалог поиска полностью - только бежит текущая сканируемая директория.
 // Иногда диалог отрисовался, но часть до текста "..." отсутствует
@@ -1949,6 +1950,192 @@ bool CRealConsole::PostKeyUp(WORD vkKey, DWORD dwControlState, wchar_t wch, int 
 	return lbOk;
 }
 
+// Used for previously executed by ConEmuHk: CECMD_BSDELETEWORD & case CECMD_MOUSECLICK
+bool CRealConsole::IsPromptActionAllowed(bool bFromMouse, const AppSettings* pApp)
+{
+	if (!this || !mp_RBuf || !pApp)
+		return false;
+
+	// Some global checks to prevent translation
+	if (m_ChildGui.hGuiWnd || isPaused() || isFar())
+		return false;
+
+	// Don't allow Ctrl+BS and prompt-mouse-click features if application
+	// has not reported "I'm in the prompt"
+	COORD crPrompt = {};
+	if (!QueryPromptStart(&crPrompt))
+		return false;
+
+	// Change prompt position with mouse click
+	if (bFromMouse)
+	{
+		bool bForce = (pApp->CTSClickPromptPosition() == 1);
+		DWORD nConInMode = mp_RBuf->GetConInMode();
+		// If application has set ENABLE_MOUSE_INPUT flag, than
+		// bypass clicks without changes to its input queue
+		if (!bForce && ((nConInMode & ENABLE_MOUSE_INPUT) == ENABLE_MOUSE_INPUT))
+			return false;
+	}
+
+	// Allow the feature
+	return true;
+}
+
+int CRealConsole::EvalPromptCtrlBSCount(const AppSettings* pApp)
+{
+	return 0;
+}
+
+int CRealConsole::EvalPromptLeftRightCount(const AppSettings* pApp, COORD crMouse, WORD& vkKey)
+{
+	COORD crCursor = {}, crPrompt = {};
+	// must be already checked, just query the coords
+	if (!QueryPromptStart(&crPrompt))
+		return 0;
+	mp_RBuf->GetCursorInfo(&crCursor, NULL);
+	CRConDataGuard data;
+	ConsoleLinePtr line = {};
+	if (!mp_RBuf->GetConsoleLine(crCursor.Y, data, line))
+		return 0;
+	int nKeyCount = 0;
+
+	SHORT y = data->m_sbi.dwCursorPosition.Y;
+	while (line.pChar)
+	{
+		cr.Y = y;
+		if (nChars > 0)
+		{
+			cr.X = (y == data->m_sbi.dwCursorPosition.Y) ? data->m_sbi.dwCursorPosition.X : 0;
+			iCount = (y == yPos) ? (xPos - cr.X) : (data->m_sbi.dwSize.X - cr.X);
+			if (iCount < 0)
+				break;
+		}
+		else
+		{
+			cr.X = 0;
+			iCount = ((y == data->m_sbi.dwCursorPosition.Y) ? data->m_sbi.dwCursorPosition.X : data->m_sbi.dwSize.X)
+				- ((y == yPos) ? xPos : 0);
+			if (iCount < 0)
+				break;
+		}
+
+		// Считать строку
+		if (bDBCS)
+		{
+			// На DBCS кодировках "ReadConsoleOutputCharacterW" фигню возвращает
+			BOOL bReadOk = ReadConsoleOutputCharacterA(hConOut, pszLine, iCount, cr, &nRead);
+			dwLastError = GetLastError();
+
+			if (!bReadOk || !nRead)
+			{
+				// Однако и ReadConsoleOutputCharacterA может глючить, пробуем "W"
+				bReadOk = ReadConsoleOutputCharacterW(hConOut, pwszLine, iCount, cr, &nRead);
+				dwLastError = GetLastError();
+
+				if (!bReadOk || !nRead)
+					break;
+
+				bDBCS = false; // Thread string as simple Unicode.
+			}
+			else
+			{
+				nRead = MultiByteToWideChar(nCP, 0, pszLine, nRead, pwszLine, data->m_sbi.dwSize.X);
+			}
+
+			// Check chars count
+			if (((int)nRead) <= 0)
+				break;
+		}
+		else
+		{
+			if (!ReadConsoleOutputCharacterW(hConOut, pwszLine, iCount, cr, &nRead) || !nRead)
+				break;
+		}
+
+		if (nRead > (DWORD)data->m_sbi.dwSize.X)
+		{
+			_ASSERTEX(nRead <= (DWORD)data->m_sbi.dwSize.X);
+			break;
+		}
+		pwszLine[nRead] = 0;
+
+		nWhole = nPrint = (SHORT)nRead;
+		// Сначала посмотреть сколько в конце строки пробелов
+		while ((nPrint > 0) && (pwszLine[nPrint-1] == L' '))
+		{
+			nPrint--;
+		}
+
+		// В каком направлении идем
+		if (nChars > 0) // Вниз
+		{
+			// Если знаков (не пробелов) больше 0 - учитываем и концевые пробелы предыдущей строки
+			if (nPrint > 0)
+			{
+				nChecked += nPrevSpaces + nPrint;
+			}
+			else
+			{
+				// Если на предыдущей строке значащих символов не было - завершаем
+				if (nPrevChars <= 0)
+					break;
+			}
+		}
+		else // Вверх
+		{
+			if (nPrint <= 0)
+				break; // На первой же пустой строке мы останавливаемся
+			nChecked += nWhole;
+		}
+		nPrevChars = nPrint;
+		nPrevSpaces = nWhole - nPrint;
+		_ASSERTEX(nPrevSpaces>=0);
+
+
+		// Цикл + условие
+		if (nChars > 0)
+		{
+			if ((++y) > yPos)
+				break;
+		}
+		else
+		{
+			if ((--y) < yPos)
+				break;
+		}
+	}
+
+	return nKeyCount;
+}
+
+bool CRealConsole::ChangePromptPosition(const AppSettings* pApp, COORD crMouse)
+{
+	// must be already checked, just query the coords
+	COORD crPrompt = {};
+	if (!QueryPromptStart(&crPrompt))
+		return false;
+
+	WORD vkKey = VK_LEFT;
+	int nKeyCount = EvalPromptLeftRightCount(pApp, crMouse, vkKey);
+
+	if (nKeyCount > 0)
+	{
+		wchar_t szInfo[100];
+		_wsprintf(szInfo, SKIPCOUNT(szInfo) L"Changing prompt position by LClick: {%i,%i} VK=%u Count=%u", crMouse.X, crMouse.Y, vkKey, nKeyCount);
+		DEBUGSTRCLICKPOS(szInfo);
+		LogString(szInfo);
+
+		INPUT_RECORD r[2] = {};
+		const DWORD dwControlState = 0;
+		TranslateKeyPress(vkKey, dwControlState, 0, -1, &r[0], &r[1]);
+		r[0].Event.KeyEvent.wRepeatCount = nKeyCount;
+		PostConsoleEvent(&r[0]);
+		PostConsoleEvent(&r[1]);
+	}
+
+	return true;
+}
+
 bool CRealConsole::DeleteWordKeyPress(bool bTestOnly /*= false*/)
 {
 	// cygwin/msys connector - they are configured through .inputrc
@@ -1965,23 +2152,31 @@ bool CRealConsole::DeleteWordKeyPress(bool bTestOnly /*= false*/)
 	}
 
 	const AppSettings* pApp = gpSet->GetAppSettings(GetActiveAppSettingsId());
-	if (!pApp || !pApp->CTSDeleteLeftWord())
+	if (!pApp || !pApp->CTSDeleteLeftWord()
+		|| !IsPromptActionAllowed(false, pApp))
 	{
 		return false;
 	}
 
-	if (!bTestOnly)
+	if (bTestOnly)
 	{
-		CESERVER_REQ* pIn = ExecuteNewCmd(CECMD_BSDELETEWORD, sizeof(CESERVER_REQ_HDR)+sizeof(CESERVER_REQ_PROMPTACTION));
-		if (pIn)
-		{
-			pIn->Prompt.Force = (pApp->CTSDeleteLeftWord() == 1);
-			pIn->Prompt.BashMargin = pApp->CTSBashMargin();
+		return true;
+	}
 
-			CESERVER_REQ* pOut = ExecuteHkCmd(nActivePID, pIn, ghWnd);
-			ExecuteFreeResult(pOut);
-			ExecuteFreeResult(pIn);
-		}
+	int iBSCount = EvalPromptCtrlBSCount(pApp);
+	if (iBSCount > 0)
+	{
+		wchar_t szInfo[100];
+		_wsprintf(szInfo, SKIPCOUNT(szInfo) L"Delete word by Ctrl+BS: VK=%u Count=%u", VK_BACK, iBSCount);
+		DEBUGSTRCTRLBS(szInfo);
+		LogString(szInfo);
+
+		INPUT_RECORD r[2] = {};
+		const DWORD dwControlState = 0;
+		TranslateKeyPress(VK_BACK, dwControlState, 0, -1, &r[0], &r[1]);
+		r[0].Event.KeyEvent.wRepeatCount = iBSCount;
+		PostConsoleEvent(&r[0]);
+		PostConsoleEvent(&r[1]);
 	}
 
 	return true;
@@ -5102,8 +5297,15 @@ bool CRealConsole::OnMouse(UINT messg, WPARAM wParam, int x, int y, bool abForce
 	if ((messg == WM_LBUTTONUP) && !mb_WasMouseSelection
 		&& ((pApp = gpSet->GetAppSettings(GetActiveAppSettingsId())) != NULL)
 		&& pApp->CTSClickPromptPosition()
-		&& gpSet->IsModifierPressed(vkCTSVkPromptClk, true))
+		&& gpSet->IsModifierPressed(vkCTSVkPromptClk, true)
+		&& IsPromptActionAllowed(true, pApp))
 	{
+		if (ChangePromptPosition(crMouse))
+		{
+			return true;
+		}
+
+		// TODO: When using cygwin/msys connector - we shall use connector's PID to send commands
 		DWORD nActivePID = GetActivePID();
 		bool bWasSendClickToReadCon = false;
 		if (nActivePID && (mp_ABuf->m_Type == rbt_Primary) && !isFar() && !isNtvdm())
@@ -5113,12 +5315,15 @@ bool CRealConsole::OnMouse(UINT messg, WPARAM wParam, int x, int y, bool abForce
 			COORD crPrompt = {};
 			COORD crCursor = {};
 
+			CEActiveAppFlags nActiveAppFlags = GetActiveAppFlags();
+
 			GetConsoleCursorInfo(NULL, &crCursor);
 			if (QueryPromptStart(&crPrompt))
 				allow_click = (crMouse.Y >= crPrompt.Y);
 			else
 				allow_click = (crMouse.Y >= crCursor.Y);
 
+			// We use CECMD_MOUSECLICK to be sure the current process is executing the prompt at the moment
 			if (allow_click && (pIn = ExecuteNewCmd(CECMD_MOUSECLICK, sizeof(CESERVER_REQ_HDR)+sizeof(CESERVER_REQ_PROMPTACTION))))
 			{
 				pIn->Prompt.xPos = crMouse.X;
@@ -6764,6 +6969,7 @@ bool CRealConsole::ProcessXtermSubst(const INPUT_RECORD& r)
 	bool bProcessed = false;
 	bool bSend = false;
 	wchar_t szSubstKeys[16] = L"";
+	WORD nRepeatCount = 1;
 
 	// Till now, this may be ‘te_xterm’ or ‘te_win32’ only
 	_ASSERTE(m_Term.Term == te_xterm);
@@ -6778,6 +6984,8 @@ bool CRealConsole::ProcessXtermSubst(const INPUT_RECORD& r)
 			bProcessed = mp_XTerm->GetSubstitute(r.Event.KeyEvent, szSubstKeys);
 			// But only key presses are sent to terminal
 			bSend = (bProcessed && r.Event.KeyEvent.bKeyDown && szSubstKeys[0]);
+			if (r.Event.KeyEvent.wRepeatCount)
+				nRepeatCount = r.Event.KeyEvent.wRepeatCount;
 			break; // KEY_EVENT
 
 		case MOUSE_EVENT:
@@ -6789,7 +6997,11 @@ bool CRealConsole::ProcessXtermSubst(const INPUT_RECORD& r)
 
 		if (bSend)
 		{
-			PostString(szSubstKeys, _tcslen(szSubstKeys));
+			for (WORD n = 0; n < nRepeatCount; ++n)
+			{
+				if (!PostString(szSubstKeys, _tcslen(szSubstKeys)))
+					break;
+			}
 		}
 	}
 

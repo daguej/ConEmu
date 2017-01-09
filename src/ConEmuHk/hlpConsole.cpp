@@ -282,32 +282,6 @@ BOOL GetConsoleModeCached(HANDLE hConsoleHandle, LPDWORD lpMode, BOOL bForced /*
 	return lbRc;
 }
 
-bool IsPromptActionAllowed(bool bForce, bool bBashMargin, HANDLE* phConIn)
-{
-	if (!gReadConsoleInfo.InReadConsoleTID && !gReadConsoleInfo.LastReadConsoleInputTID)
-		return false;
-
-	DWORD nConInMode = 0;
-
-	HANDLE hConIn = gReadConsoleInfo.InReadConsoleTID ? gReadConsoleInfo.hConsoleInput : gReadConsoleInfo.hConsoleInput2;
-	if (!hConIn)
-		return false;
-
-	if (!gReadConsoleInfo.InReadConsoleTID && gReadConsoleInfo.LastReadConsoleInputTID)
-	{
-		// Проверить, может программа мышь сама обрабатывает?
-		if (!GetConsoleMode(hConIn, &nConInMode))
-			return false;
-		if (!bForce && ((nConInMode & ENABLE_MOUSE_INPUT) == ENABLE_MOUSE_INPUT))
-			return false; // Разрешить обрабатывать самой программе
-	}
-
-	if (phConIn)
-		*phConIn = hConIn;
-
-	return true;
-}
-
 BOOL OnPromptBsDeleteWord(bool bForce, bool bBashMargin)
 {
 	HANDLE hConIn = NULL;
